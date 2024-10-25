@@ -48,10 +48,13 @@ func init() {
 }
 
 type BankSystem struct {
-	LambdaC float64
-	LambdaF float64
-	Banks   map[string]Bank
-	game    *Game
+	LambdaC     float64 // Параметр lambda для кредитного шока
+	LambdaF     float64 // Параметр lambda для шока фондирования
+	EnablePanic bool    // Параметр для включения / выключения паники
+	PanicRate   float64 // Параметр p для доли закрываемых вкладов
+
+	Banks map[string]Bank
+	game  *Game
 }
 
 type Bank struct {
@@ -62,11 +65,13 @@ type Bank struct {
 }
 
 type Game struct {
-	bankSystem *BankSystem
-	message    string        // Сообщение события вверху экрана
-	nextStep   chan struct{} // Канал для перехода к следующему шагу визуализации
+	bankSystem    *BankSystem
+	message       string        // Сообщение события вверху экрана
+	nextStep      chan struct{} // Канал для перехода к следующему шагу визуализации
+	staticMessage string        // Статический текст в правой верхней части экрана
 }
 
+// Update обрабатывает нажатие Enter на клавиатуре для перехода к следующему шагу визуализации
 func (g *Game) Update() error {
 	// Обрабатываем нажатие Enter на клавиатуре для перехода к следующему шагу визуализации
 	if inpututil.IsKeyJustPressed(ebiten.KeyEnter) {
@@ -74,6 +79,9 @@ func (g *Game) Update() error {
 		case g.nextStep <- struct{}{}:
 		default:
 		}
+	}
+	if inpututil.IsKeyJustPressed(ebiten.KeyEscape) {
+		os.Exit(0)
 	}
 	return nil
 }
@@ -89,7 +97,11 @@ func (g *Game) Draw(screen *ebiten.Image) {
 
 	// Отображаем текущее событие вверху экрана
 	drawText(screen, g.message, 10, 20)
-	drawText(screen, "Нажмите Enter для продолжения", 10, 40)
+	drawText(screen, "Нажмите Enter для продолжения\n", 10, 40)
+	drawText(screen, "Нажмите Esc для выхода\n", 10, screenHeight-10)
+
+	// Отображаем статический текст в правой верхней части экрана
+	drawText(screen, g.staticMessage, screenWidth-80, 20)
 
 	// Сначала рисуем все стрелки
 	for _, bank := range g.bankSystem.Banks {
@@ -120,6 +132,7 @@ func (g *Game) Layout(outsideWidth, outsideHeight int) (int, int) {
 
 // drawArrow рисует стрелку на экране отображающую зависимость между двумя банками
 func (g *Game) drawArrow(screen *ebiten.Image, x1, y1, x2, y2, amount float64) {
+	// Сложные математические и не только приколы которые я все таки постараюсь объяснить
 	dx := x2 - x1
 	dy := y2 - y1
 	length := math.Sqrt(dx*dx + dy*dy)
@@ -219,7 +232,7 @@ func (g *Game) drawArrow(screen *ebiten.Image, x1, y1, x2, y2, amount float64) {
 	}
 }
 
-// Вспомогательная функция для рисования наконечника стрелки
+// drawArrowHead это вспомогательная функция для рисования наконечника стрелки
 func drawArrowHead(screen *ebiten.Image, x, y, dx, dy float64) {
 	arrowSize := float64(10)
 	angle := math.Pi / 6
@@ -238,7 +251,7 @@ func drawArrowHead(screen *ebiten.Image, x, y, dx, dy float64) {
 
 // calculateBankPositions вычисляет координаты банков в системе
 func calculateBankPositions(banks map[string]Bank) map[string]Bank {
-	// Опять страшные математические приколы которые я что? Правильно, не буду объяснять
+	// Опять страшные математические приколы которые я что? Правильно, не буду объяснять, и так наобъяснялся сверху
 	numBanks := len(banks)
 	angle := 2 * math.Pi / float64(numBanks)
 	centerX := float64(screenWidth) / 2
@@ -255,55 +268,118 @@ func calculateBankPositions(banks map[string]Bank) map[string]Bank {
 	return banks
 }
 
-// Bankruptcy обработка банкротства каждого отдельного банка
+// Bankruptcy основная функция для просчитывания последствий банкротства банков
 func (s *BankSystem) Bankruptcy(bankruptBankName string) {
-	bankruptBank := s.Banks[bankruptBankName]
-	bankruptBank.Bankrupt = true
-	s.Banks[bankruptBankName] = bankruptBank
+	// Очередь для обработки банкротств текущего уровня
+	currentLevel := []string{bankruptBankName}
 	s.game.message = fmt.Sprintf("Банк %s обанкротился", bankruptBankName)
 	<-s.game.nextStep
 
-	// Просчитываем шок фондирования
-	for bankName, amount := range bankruptBank.Dependencies {
-		bank := s.Banks[bankName]
-		shockImpact := amount * s.LambdaF
-		bank.Balance -= shockImpact
-		s.Banks[bankName] = bank
-		s.game.message = fmt.Sprintf("Шок фондирования: Банк %s потерял %.2f", bankName, shockImpact)
-		<-s.game.nextStep
+	for len(currentLevel) > 0 {
+		nextLevel := make([]string, 0)
 
-		if bank.Balance < 0 && !bank.Bankrupt {
-			s.game.message = fmt.Sprintf("Банк %s обанкротился из-за шока фондирования", bankName)
-			<-s.game.nextStep
-			s.Bankruptcy(bankName)
+		// Обрабатываем все банкротства текущего уровня
+		for _, bankName := range currentLevel {
+			bankruptBank := s.Banks[bankName]
+			s.Banks[bankName] = bankruptBank
+
+			// Запускаем панику для текущего банка
+			s.BankRun(bankName)
+
+			// Обрабатываем шок фондирования
+			for partnerName, amount := range bankruptBank.Dependencies {
+				partner := s.Banks[partnerName]
+				if !partner.Bankrupt {
+					shockImpact := amount * s.LambdaF
+					partner.Balance -= shockImpact
+					s.Banks[partnerName] = partner
+					s.game.message = fmt.Sprintf("Шок фондирования в связи с банкротсвом банка %s: Банк %s потерял %.2f", bankName, partnerName, shockImpact)
+					<-s.game.nextStep
+				}
+			}
+
+			// Обрабатываем кредитный шок
+			for partnerName, partner := range s.Banks {
+				if creditAmount, exists := partner.Dependencies[bankName]; exists && !partner.Bankrupt {
+					shockImpact := creditAmount * s.LambdaC
+					partner.Balance -= shockImpact
+					s.Banks[partnerName] = partner
+					s.game.message = fmt.Sprintf("Кредитный шок в связи с банкротсвом банка %s: Банк %s потерял %.2f", bankName, partnerName, shockImpact)
+					<-s.game.nextStep
+				}
+			}
+		}
+
+		// Проверяем новые банкротства для следующего уровня
+		for bankName, bank := range s.Banks {
+			if bank.Balance < 0 && !bank.Bankrupt {
+				s.game.message = fmt.Sprintf("Банк %s обанкротился", bankName)
+				<-s.game.nextStep
+				nextLevel = append(nextLevel, bankName)
+				bank.Bankrupt = true
+				s.Banks[bankName] = bank
+			}
+		}
+
+		// Переходим к следующему уровню
+		currentLevel = nextLevel
+	}
+}
+
+func (s *BankSystem) BankRun(bankruptBankName string) {
+	if !s.EnablePanic {
+		return
+	}
+
+	bankruptBank := s.Banks[bankruptBankName]
+
+	// Находим всех партнеров обанкротившегося банка
+	partners := make(map[string]bool)
+
+	// Кредиторы (те, кто вложил в банкрота)
+	for bankName, bank := range s.Banks {
+		if _, exists := bank.Dependencies[bankruptBankName]; exists {
+			partners[bankName] = true
 		}
 	}
 
-	// Просчитываем кредитный шок
-	for bankName, bank := range s.Banks {
-		if creditAmount, exists := bank.Dependencies[bankruptBankName]; exists {
-			shockImpact := creditAmount * s.LambdaC
-			bank.Balance -= shockImpact
-			s.Banks[bankName] = bank
-			s.game.message = fmt.Sprintf("Кредитный шок: Банк %s потерял %.2f", bankName, shockImpact)
-			<-s.game.nextStep
+	// Должники (те, кому банкрот дал в долг)
+	for debtor := range bankruptBank.Dependencies {
+		partners[debtor] = true
+	}
 
-			if bank.Balance <= 0 && !bank.Bankrupt {
-				s.game.message = fmt.Sprintf("Банк %s обанкротился из-за кредитного шока", bankName)
-				<-s.game.nextStep
-				s.Bankruptcy(bankName)
+	// Симулируем набег на каждого партнера
+	for partnerName := range partners {
+		partner := s.Banks[partnerName]
+		if !partner.Bankrupt { // Проверяем, что партнер еще не обанкротился
+
+			// Закрываем долю p вкладов
+			for bankName, bank := range s.Banks {
+				if !bank.Bankrupt { // Проверяем что банк еще не обанкротился
+					if amount, exists := bank.Dependencies[partnerName]; exists {
+						partner.Balance -= amount * s.PanicRate
+						s.Banks[partnerName] = partner
+						bank.Balance += amount * s.PanicRate
+						s.Banks[bankName] = bank
+						s.game.message = fmt.Sprintf("Набег вкладчиков: Банк %s забирает %.2f из своего вклада в банк %s в связи с банкротством банка %s",
+							bankName, amount*s.PanicRate, partnerName, bankruptBankName)
+						<-s.game.nextStep
+					}
+				}
 			}
 		}
 	}
 }
 
 func (s *BankSystem) StressTest(bankName string) {
+	s.game.message = "Начальное состояние банковской системы"
+	<-s.game.nextStep
 	s.game.message = fmt.Sprintf("Начало стресс-теста: банк %s объявляется банкротом", bankName)
 	<-s.game.nextStep
 
 	bank := s.Banks[bankName]
 	bank.Bankrupt = true
-	bank.Balance = 0
+	bank.Balance = -1
 	s.Banks[bankName] = bank
 
 	s.Bankruptcy(bankName)
@@ -313,25 +389,53 @@ func (s *BankSystem) StressTest(bankName string) {
 }
 
 func main() {
+	//X := 2000.0 // Баланс каждого банка
+	//Y := 5000.0 // Сумма задолженности каждого банка
+	//p := 1.0    // Процент от вклада который заберет банк при набеге
+	//lambda := 0.9
+	//
+	//_ = map[string]Bank{
+	//	"1": {Balance: X, Dependencies: map[string]float64{"2": Y / 4, "3": Y / 4, "4": Y / 4, "5": Y / 4}},
+	//	"2": {Balance: X, Dependencies: map[string]float64{"1": Y / 4, "3": Y / 4, "4": Y / 4, "5": Y / 4}},
+	//	"3": {Balance: X, Dependencies: map[string]float64{"1": Y / 4, "2": Y / 4, "4": Y / 4, "5": Y / 4}},
+	//	"4": {Balance: X, Dependencies: map[string]float64{"1": Y / 4, "2": Y / 4, "3": Y / 4, "5": Y / 4}},
+	//	"5": {Balance: X, Dependencies: map[string]float64{"1": Y / 4, "2": Y / 4, "3": Y / 4, "4": Y / 4}},
+	//}
+	//
+	//banks := map[string]Bank{
+	//	"1": {Balance: X, Dependencies: map[string]float64{"2": Y / 2, "5": Y / 2}},
+	//	"2": {Balance: X, Dependencies: map[string]float64{"1": Y / 2, "3": Y / 2}},
+	//	"3": {Balance: X, Dependencies: map[string]float64{"2": Y / 2, "4": Y / 2}},
+	//	"4": {Balance: X, Dependencies: map[string]float64{"3": Y / 2, "5": Y / 2}},
+	//	"5": {Balance: X, Dependencies: map[string]float64{"1": Y / 2, "4": Y / 2}},
+	//}
+
+	X := 1500.0 // Баланс каждого банка
+	Y := 2000.0 // Сумма задолженности каждого банка
+	lambda := 0.8
+
 	banks := map[string]Bank{
-		"1": {Balance: 2000, Dependencies: map[string]float64{"2": 2000, "3": 2000}},
-		"2": {Balance: 4000, Dependencies: map[string]float64{"1": 1000, "3": 5000}},
-		"3": {Balance: 4000, Dependencies: map[string]float64{"2": 3000, "1": 1000}},
+		"1": {Balance: X, Dependencies: map[string]float64{"2": Y / 4, "3": Y / 4, "4": Y / 4, "5": Y / 4}},
+		"2": {Balance: X, Dependencies: map[string]float64{"1": Y / 4, "3": Y / 4, "4": Y / 4, "5": Y / 4}},
+		"3": {Balance: X, Dependencies: map[string]float64{"1": Y / 4, "2": Y / 4, "4": Y / 4, "5": Y / 4}},
+		"4": {Balance: X, Dependencies: map[string]float64{"1": Y / 4, "2": Y / 4, "3": Y / 4, "5": Y / 4}},
+		"5": {Balance: X, Dependencies: map[string]float64{"1": Y / 4, "2": Y / 4, "3": Y / 4, "4": Y / 4}},
 	}
 
 	banks = calculateBankPositions(banks)
 
-	game := &Game{
-		nextStep: make(chan struct{}, 1),
-		message:  "Начальное состояние банковской системы",
+	bankSystem := &BankSystem{
+		LambdaC: lambda,
+		LambdaF: lambda,
+		Banks:   banks,
 	}
 
-	bankSystem := &BankSystem{
-		LambdaC: 0.5,
-		LambdaF: 1,
-		Banks:   banks,
-		game:    game,
+	game := &Game{
+		nextStep:      make(chan struct{}, 1),
+		staticMessage: fmt.Sprintf("λc = %.2f\nλf = %.2f\np = %.2f\npanic = %t", bankSystem.LambdaC, bankSystem.LambdaF, bankSystem.PanicRate, bankSystem.EnablePanic),
 	}
+
+	bankSystem.game = game
 	game.bankSystem = bankSystem
 
 	ebiten.SetWindowSize(screenWidth, screenHeight)
