@@ -127,8 +127,8 @@ func (s *BankSystem) StressTest(bankName string) int {
 }
 
 func main() {
-	X := 1000.0  // Баланс каждого банка
-	Y := 10000.0 // Сумма задолженности каждого банка
+	X := 1000.0 // Баланс каждого банка
+	Y := 5000.0 // Сумма задолженности каждого банка
 
 	banksFull := map[string]Bank{
 		"1": {Balance: X, Dependencies: map[string]float64{"2": Y / 4, "3": Y / 4, "4": Y / 4, "5": Y / 4}},
